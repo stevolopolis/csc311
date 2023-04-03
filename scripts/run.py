@@ -13,9 +13,12 @@ import os
 import commentjson as json
 
 import numpy as np
+import matplotlib.pyplot as plt
+from torch.utils.tensorboard import SummaryWriter
 
 import shutil
 import time
+import random
 
 from common import *
 from scenes import *
@@ -65,16 +68,89 @@ def parse_args():
 	parser.add_argument("--second_window", action="store_true", help="Open a second window containing a copy of the main output.")
 	parser.add_argument("--vr", action="store_true", help="Render to a VR headset.")
 
+	parser.add_argument("--log", default="", help="If log is enabled, training progression will be logged with Tensorboard.")
+
 	parser.add_argument("--sharpen", default=0, help="Set amount of sharpening applied to NeRF training images. Range 0.0 to 1.0.")
 
 
 	return parser.parse_args()
+
 
 def get_scene(scene):
 	for scenes in [scenes_sdf, scenes_nerf, scenes_image, scenes_volume]:
 		if scene in scenes:
 			return scenes[scene]
 	return None
+
+
+def render_eval(test_transforms, save_img_path=None, n_test=None, iter_n=None):
+	totmse = 0
+	totpsnr = 0
+	totssim = 0
+	totcount = 0
+	minpsnr = 1000
+	maxpsnr = 0
+
+	# Evaluate metrics on black background
+	testbed.background_color = [0.0, 0.0, 0.0, 1.0]
+
+	# Prior nerf papers don't typically do multi-sample anti aliasing.
+	# So snap all pixels to the pixel centers.
+	testbed.snap_to_pixel_centers = True
+	spp = 8
+
+	testbed.nerf.render_min_transmittance = 1e-4
+
+	testbed.shall_train = False
+	testbed.load_training_data(test_transforms)
+
+	n_imgs = testbed.nerf.training.dataset.n_images
+	img_idx = [i for i in range(n_imgs)]
+	random.seed(42)
+	if n_test is not None:
+		n_imgs = n_test
+		random.shuffle(img_idx)
+		img_idx = img_idx[:n_test]
+
+	rendered_img_list = []
+	for n, idx in enumerate(img_idx):
+		resolution = testbed.nerf.training.dataset.metadata[idx].resolution
+		testbed.set_camera_to_training_view(idx)
+		testbed.render_ground_truth = True
+		ref_image = testbed.render(resolution[0], resolution[1], 1, True)
+		testbed.render_ground_truth = False
+		image = testbed.render(resolution[0], resolution[1], spp, True)
+
+		if str(idx) not in os.listdir(save_img_path):
+			os.makedirs(os.path.join(save_img_path, str(idx)))
+		if "ref_%s.png" % idx not in os.listdir(os.path.join(save_img_path, str(idx))):
+			write_image("%s/%s/ref_%s.png" % (save_img_path, idx, idx), ref_image, return_img=False)
+			
+		if save_img_path:
+			img = write_image("%s/%s/out_iter_%s_%s.png" % (save_img_path, idx, iter_n, idx), image, return_img=True)
+			rendered_img_list.append(img)
+
+		A = np.clip(linear_to_srgb(image[...,:3]), 0.0, 1.0)
+		R = np.clip(linear_to_srgb(ref_image[...,:3]), 0.0, 1.0)
+		mse = float(compute_error("MSE", A, R))
+		ssim = float(compute_error("SSIM", A, R))
+		totssim += ssim
+		totmse += mse
+		psnr = mse2psnr(mse)
+		totpsnr += psnr
+		minpsnr = psnr if psnr<minpsnr else minpsnr
+		maxpsnr = psnr if psnr>maxpsnr else maxpsnr
+		totcount = totcount+1
+		t.set_postfix(psnr = totpsnr/(totcount or 1))
+
+	psnr_avgmse = mse2psnr(totmse/(totcount or 1))
+	psnr = totpsnr/(totcount or 1)
+	ssim = totssim/(totcount or 1)
+
+	testbed.shall_train = True
+
+	return psnr, minpsnr, maxpsnr, ssim, np.array(rendered_img_list)
+
 
 if __name__ == "__main__":
 	args = parse_args()
@@ -86,7 +162,7 @@ if __name__ == "__main__":
 
 	testbed = ngp.Testbed()
 	testbed.root_dir = ROOT_DIR
-
+	
 	for file in args.files:
 		scene_info = get_scene(file)
 		if scene_info:
@@ -177,7 +253,10 @@ if __name__ == "__main__":
 		n_steps = 35000
 
 	tqdm_last_update = 0
+	loss_vals = []
 	if n_steps > 0:
+		if args.log:
+			writer = SummaryWriter(args.log)
 		with tqdm(desc="Training", total=n_steps, unit="step") as t:
 			while testbed.frame():
 				if testbed.want_repl():
@@ -193,13 +272,24 @@ if __name__ == "__main__":
 				if testbed.training_step < old_training_step or old_training_step == 0:
 					old_training_step = 0
 					t.reset()
-
+				
 				now = time.monotonic()
 				if now - tqdm_last_update > 0.1:
 					t.update(testbed.training_step - old_training_step)
 					t.set_postfix(loss=testbed.loss)
 					old_training_step = testbed.training_step
 					tqdm_last_update = now
+
+				# Saving loss curve for later
+				if args.log:
+					writer.add_scalar("Training loss", testbed.loss, testbed.training_step)
+					if testbed.training_step % 2500 == 0:
+						psnr, minpsnr, maxpsnr, ssim, rendered_img_batch = render_eval(args.screenshot_transforms, save_img_path=args.screenshot_dir, n_test=10, iter_n=testbed.training_step)
+						writer.add_scalars("psnr", {"psnr": psnr, "minpsnr": minpsnr, "maxpsnr": maxpsnr}, testbed.training_step)
+						writer.add_scalar("ssim", ssim, testbed.training_step)
+						writer.add_images("Rendered images", rendered_img_batch[...,0:3], testbed.training_step, dataformats='NHWC')
+						
+						testbed.load_training_data(args.scene)
 
 	if args.save_snapshot:
 		testbed.save_snapshot(args.save_snapshot, False)
@@ -208,68 +298,17 @@ if __name__ == "__main__":
 		print("Evaluating test transforms from ", args.test_transforms)
 		with open(args.test_transforms) as f:
 			test_transforms = json.load(f)
-		data_dir=os.path.dirname(args.test_transforms)
-		totmse = 0
-		totpsnr = 0
-		totssim = 0
-		totcount = 0
-		minpsnr = 1000
-		maxpsnr = 0
 
-		# Evaluate metrics on black background
-		testbed.background_color = [0.0, 0.0, 0.0, 1.0]
-
-		# Prior nerf papers don't typically do multi-sample anti aliasing.
-		# So snap all pixels to the pixel centers.
-		testbed.snap_to_pixel_centers = True
-		spp = 8
-
-		testbed.nerf.render_min_transmittance = 1e-4
-
-		testbed.shall_train = False
-		testbed.load_training_data(args.test_transforms)
-
-		with tqdm(range(testbed.nerf.training.dataset.n_images), unit="images", desc=f"Rendering test frame") as t:
-			for i in t:
-				resolution = testbed.nerf.training.dataset.metadata[i].resolution
-				testbed.render_ground_truth = True
-				testbed.set_camera_to_training_view(i)
-				ref_image = testbed.render(resolution[0], resolution[1], 1, True)
-				testbed.render_ground_truth = False
-				image = testbed.render(resolution[0], resolution[1], spp, True)
-
-				if i == 0:
-					write_image(f"ref.png", ref_image)
-					write_image(f"out.png", image)
-
-					diffimg = np.absolute(image - ref_image)
-					diffimg[...,3:4] = 1.0
-					write_image("diff.png", diffimg)
-
-				A = np.clip(linear_to_srgb(image[...,:3]), 0.0, 1.0)
-				R = np.clip(linear_to_srgb(ref_image[...,:3]), 0.0, 1.0)
-				mse = float(compute_error("MSE", A, R))
-				ssim = float(compute_error("SSIM", A, R))
-				totssim += ssim
-				totmse += mse
-				psnr = mse2psnr(mse)
-				totpsnr += psnr
-				minpsnr = psnr if psnr<minpsnr else minpsnr
-				maxpsnr = psnr if psnr>maxpsnr else maxpsnr
-				totcount = totcount+1
-				t.set_postfix(psnr = totpsnr/(totcount or 1))
-
-		psnr_avgmse = mse2psnr(totmse/(totcount or 1))
-		psnr = totpsnr/(totcount or 1)
-		ssim = totssim/(totcount or 1)
+		psnr, minpsnr, maxpsnr, ssim = render_eval(args.test_transforms)
 		print(f"PSNR={psnr} [min={minpsnr} max={maxpsnr}] SSIM={ssim}")
+		
 
 	if args.save_mesh:
 		res = args.marching_cubes_res or 256
 		print(f"Generating mesh via marching cubes and saving to {args.save_mesh}. Resolution=[{res},{res},{res}]")
 		testbed.compute_and_save_marching_cubes_mesh(args.save_mesh, [res, res, res])
 
-	if ref_transforms:
+	"""if ref_transforms:
 		testbed.fov_axis = 0
 		testbed.fov = ref_transforms["camera_angle_x"] * 180 / np.pi
 		if not args.screenshot_frames:
@@ -296,7 +335,7 @@ if __name__ == "__main__":
 		if os.path.dirname(outname) != "":
 			os.makedirs(os.path.dirname(outname), exist_ok=True)
 		write_image(outname + ".png", image)
-
+	"""
 	if args.video_camera_path:
 		testbed.load_camera_path(args.video_camera_path)
 
